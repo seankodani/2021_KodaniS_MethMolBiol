@@ -1,0 +1,200 @@
+---
+title: "Brown Adipocyte Lipidomics Analysis"
+date: "Generated on `r format(Sys.Date(), '%B %d, %Y')`"
+output: html_document
+number_sections: yes
+toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+require("knitr")
+knitr::opts_chunk$set(fig.align = 'center', echo = TRUE)
+opts_knit$set(root.dir = "C:/Users/SeanK/Desktop/MetaboDiffData/")
+options(knitr.table.format = "html")
+
+```
+
+## Introduction
+
+This script is intended to be a template for analyzing signaling lipidomics data in R. It primarily uses the package MetaboDiff to perform the principle component analyses and hypothesis testing. A general tutorial for this package which is the basis for this script  is available at https://rawgit.com/andreasmock/MetaboDiff/master/vignettes/MetaboDiff_tutorial.html. It is intended to be adjusted based on individual needs.
+
+Before starting the analyses, the following packages need to be installed: tidyverse, readxl, knitr, WGCNA and MetaboDiff. Additionally, every time an analysis is run, the libraries need to be uploaded
+
+```{r libraries, include = FALSE}
+
+# Install packages that are used in this analysis if they have not already been installed by R. To install, remove the pound
+
+# install.packages("tidyverse")
+# install.packages("readxl")
+# install.packages("knitr")
+# install.packages("kableExtra")
+# install.packages("WGCNA")
+# BiocManager::install("GO.db")
+# library("devtools")
+# install_github("andreasmock/MetaboDiff")
+
+# Upload libraries of the above packages (this needs to be done each time R is being used for analysis).
+
+library(MetaboDiff)
+library(tidyverse)
+library(readxl)
+library(knitr)
+library(kableExtra)
+
+```
+
+## Loading Data
+
+Once the packages have been loaded, the data needs to be uploaded. For using MetaboDiff, we need three pieces of data: the assay data (or the experimental results), the colData (or the data on the individual samples) and the rowData (or the data on the analytes). From this, we create a MultiAssayExperiment object using create_mae().
+
+``` {r data, echo = TRUE}
+
+rowData <- read.csv("./2021_KodaniS_Metabolite_Classification_alt.csv", row.names = 1)
+
+assay <- read.csv("./SDK095_Data.csv", row.names = 1)
+
+assay[assay == 0] <- NA
+
+# Note that in later steps for imputation, the zero values need to be listed as NA to analyze.
+
+colData <- read.csv("./SDK095_Groups.csv", row.names = 1)
+
+mae <- create_mae(assay, rowData, colData)
+
+
+```
+
+Note that at this step the metabolites can be annotated for pathway analysis at this step. However, most of the oxylipins analyzed here are not annotated.
+
+## Imputation of Missing Data and Outliers
+
+### Imputation of missing values. 
+
+To look at how much of the data is missing, MetaboDiff allows to generate a heatmap of missing vs. present data. MetaboDiff uses k-nearest neighbors for imputation. The recommended cutoff for MetaboDiff is 40% of the data (over 40% of the data has to be missing for imputation to be skipped). Once we perform this step, we can see that the difference in raw vs. imputed data is 113 vs. 93 rows, indicating 20 metabolites did not meet this cutoff.
+
+```{r heatmap, echo = TRUE}
+na_heatmap(mae,
+           group_factor = "group",
+           label_colors = c("darkseagreen", "dodgerblue", "firebrick", "forestgreen", "gold", "#A7A7A7"))
+
+(mae = knn_impute(mae, cutoff = 0.4))
+```
+
+It can be helpful to look at which metabolites were removed from analysis.
+
+```{r excluded-metabolites, echo = TRUE}
+
+raw.names <- mae@ExperimentList@listData[["raw"]]@NAMES
+imputed.names <- mae@ExperimentList@listData[["imputed"]]@NAMES
+intersect(raw.names, imputed.names)
+setdiff(raw.names, imputed.names)
+
+```
+
+### Outliers
+
+To look at whether there are any outliers before normalization occurs, we can visual a heatmap of the raw data. In this case, we cluster the data with k-means clustering to identify whether any individual samples are particularly different from others. In this sample data, there is one sample from the vehicle.lysate group that clusters independently from the rest, so it will be removed.
+
+```{r outliers, echo = TRUE}
+
+outlier_heatmap(mae,
+                group_factor = "group",
+                label_colors = c("darkseagreen", "dodgerblue", "firebrick", "forestgreen", "gold", "#A7A7A7"),
+                k = 2)
+
+mae <- remove_cluster(mae, cluster = 2)
+```
+
+## Data normalization
+
+Next, we will normalize the data. To determine the quality of the normalization process, we will use quality_plot(). This shows distribution of data for each sample in the dataset. Normalized data for raw and imputed datasets should contain less variance across samples relative to the unnormalized data. 
+
+```{r normalization, echo = TRUE}
+mae <- normalize_met(mae)
+
+quality_plot(mae,
+             group_factor = "group",
+             label_colors = c("darkseagreen", "dodgerblue", "firebrick", "forestgreen", "gold", "#A7A7A7"))
+```
+
+## Unsupervised analysis using PCA or tSNE.
+
+Now that the data has been processed, we will start to analyze the data. The first approach at looking at the data will be run unsupervised clustering (principal component analysis, PCA, and t-distribution stochastic neighbor embedding, tSNE). It should be noted that the tSNE run here is not particularly useful since this dataset has relatively low dimensionality.
+
+```{r unsupervised clustering, echo = TRUE}
+source("http://peterhaschke.com/Code/multiplot.R")
+
+multiplot(
+  pca_plot(mae,
+           group_factor = "group",
+           label_colors = c("darkseagreen", "dodgerblue", "firebrick", "forestgreen", "gold", "#A7A7A7")),
+  tsne_plot(mae,
+            group_factor = "group",
+            label_colors = c("darkseagreen", "dodgerblue", "firebrick", "forestgreen", "gold", "#A7A7A7")),
+  cols = 2
+)
+```
+
+Here, we can see that the PCA plot is able to distinguish groups across multiple dimensions. The difference in sample type (between media and lysate) is distinguished across the first priniciple component and accounts for 31% of the variance. This should be expected as the sample type is likely to be the biggest determinant of the lipidome here. Next, we can see that to forskolin loosely clusters away from vehicle + A23187 in the media and A23187 from vehicle + forskolin in the lysate.
+
+## Hypothesis Testing
+
+Since we want to analyze a lot of the groups as paired comparisons (and not to analyze all of the samples together), we want to try to subset the groups. For subsetting the MultiAssayExperiment, need to use the format of object[i = rownames, j = colnames, k = assay]. 
+
+```{r subsetting, echo = TRUE}
+
+# Media Vehicle vs. A23187
+
+mae_media_a23187 <- mae[ , mae$sample.type == "cell.media" & mae$treatment != "forskolin", ]
+
+mae_media_a23187 = diff_test(mae_media_a23187,
+                       group_factors = "treatment")
+
+volcano_plot(mae_media_a23187,
+             group_factor = "treatment",
+             label_colors = c("darkseagreen", "dodgerblue"),
+             dm_cutoff = 0.5,
+             p_adjust = TRUE)
+
+# Media Vehicle vs. Forskolin
+
+mae_media_forskolin <- mae[ , mae$sample.type == "cell.media" & mae$treatment != "a23187", ]
+
+mae_media_forskolin = diff_test(mae_media_forskolin,
+                             group_factors = "treatment")
+
+volcano_plot(mae_media_forskolin,
+             group_factor = "treatment",
+             label_colors = c("darkseagreen", "dodgerblue"),
+             dm_cutoff = 0.5,
+             p_adjust = TRUE)
+
+# Lysate Vehicle vs. A23187
+
+mae_lysate_a23187 <- mae[ , mae$sample.type == "cell.lysate" & mae$treatment != "forskolin", ]
+
+mae_lysate_a23187 = diff_test(mae_lysate_a23187,
+                             group_factors = "treatment")
+
+volcano_plot(mae_lysate_a23187,
+             group_factor = "treatment",
+             label_colors = c("darkseagreen", "dodgerblue"),
+             dm_cutoff = 0.5,
+             p_adjust = TRUE)
+
+# Lysate Vehicle vs. Forskolin
+
+mae_lysate_forskolin <- mae[ , mae$sample.type == "cell.lysate" & mae$treatment != "a23187", ]
+
+mae_lysate_forskolin = diff_test(mae_lysate_forskolin,
+                             group_factors = "treatment")
+
+volcano_plot(mae_lysate_forskolin,
+             group_factor = "treatment",
+             label_colors = c("darkseagreen", "dodgerblue"),
+             dm_cutoff = 0.5,
+             p_adjust = TRUE)
+
+```
+
+Based on these graphs, it appears that only the media of vehicle vs. forskolin treated cells and lysate of vehicle vs. A23187 treated cells has significantly different metabolites. The media of vehicle vs. forskolin treated cells will be explored further since it appears to have the greatest number of significant metabolites, 
